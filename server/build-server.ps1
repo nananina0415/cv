@@ -1,3 +1,5 @@
+param([switch]$r)
+
 # [shell] Locate conda via CONDA_BASE
 # CONDA_BASE is set once by setup-server.ps1 as a user environment variable
 # PATH is not permanently modified - only this session uses conda paths
@@ -17,4 +19,4 @@ conda activate cadverse
 
 # [shell] Invoke cargo
 # env update and conda-pack are handled inside build.rs
-cargo build --manifest-path server/Cargo.toml
+cargo build --manifest-path Cargo.toml $(if ($r) { "--release" })
