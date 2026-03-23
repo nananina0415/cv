@@ -12,6 +12,7 @@ use iroh::{endpoint::presets, Endpoint, EndpointAddr, EndpointId};
 use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use tokio::sync::mpsc;
 
 // ── 공개 타입 ────────────────────────────────────────────────────────────────
 
@@ -49,17 +50,27 @@ impl Connection {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub enum PeerType {
+    /// 시뮬레이션 서버 - HTTP/3 및 QUIC 데이터 채널 제공
+    SimServer { http_port: u16, udp_port: u16 },
+    /// 중계 서버 - 시뮬 없이 네트워크 참여만
+    MidServer,
+    /// AR 클라이언트 - QUIC 데이터 채널만 제공
+    ArClient { udp_port: u16 },
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub addr: NodeAddr,
     pub name: String,
-    pub is_server: bool,
+    pub peer_type: PeerType,
 }
 
 pub struct JoinForm {
     pub net_id: NetId,
     pub pw: Password,
     pub my_name: String,
-    pub is_server: bool,
+    pub peer_type: PeerType,
 }
 
 // ── ALPN 식별자 ──────────────────────────────────────────────────────────────
@@ -240,26 +251,42 @@ async fn handle_coord_conn(conn: iroh::endpoint::Connection, peers: PeerMap) {
     }
 }
 
-// 코디네이터: 연결 수신 루프
-async fn coord_accept_loop(endpoint: Endpoint, peers: PeerMap) {
+// 통합 accept 루프: ALPN별로 분기
+// coord_peers = Some → 코디네이터, None → 일반 피어
+async fn accept_loop(
+    endpoint: Endpoint,
+    coord_peers: Option<PeerMap>,
+    data_tx: mpsc::Sender<iroh::endpoint::Connection>,
+    http_tx: mpsc::Sender<iroh::endpoint::Connection>,
+) {
     loop {
         let Some(incoming) = endpoint.accept().await else { break };
-        let peers = peers.clone();
+        let coord_peers = coord_peers.clone();
+        let data_tx = data_tx.clone();
+        let http_tx = http_tx.clone();
         tokio::spawn(async move {
             let mut accepting = match incoming.accept() {
                 Ok(a) => a,
-                Err(e) => { eprintln!("[coord] accept error: {e}"); return; }
+                Err(e) => { eprintln!("[accept] error: {e}"); return; }
             };
             let alpn = match accepting.alpn().await {
                 Ok(a) => a,
-                Err(e) => { eprintln!("[coord] alpn error: {e}"); return; }
+                Err(e) => { eprintln!("[accept] alpn error: {e}"); return; }
             };
-            if alpn != COORD_ALPN { return; }
             let conn = match accepting.await {
                 Ok(c) => c,
-                Err(e) => { eprintln!("[coord] conn error: {e}"); return; }
+                Err(e) => { eprintln!("[accept] conn error: {e}"); return; }
             };
-            handle_coord_conn(conn, peers).await;
+
+            if alpn == COORD_ALPN {
+                if let Some(peers) = coord_peers {
+                    handle_coord_conn(conn, peers).await;
+                }
+            } else if alpn == DATA_ALPN {
+                let _ = data_tx.send(conn).await;
+            } else if alpn == HTTP_ALPN {
+                let _ = http_tx.send(conn).await;
+            }
         });
     }
 }
@@ -328,7 +355,7 @@ async fn peer_heartbeat_loop(conn: iroh::endpoint::Connection) {
 
 async fn create_endpoint() -> Result<Endpoint> {
     let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![COORD_ALPN.to_vec(), DATA_ALPN.to_vec()])
+        .alpns(vec![COORD_ALPN.to_vec(), DATA_ALPN.to_vec(), HTTP_ALPN.to_vec()])
         .bind()
         .await?;
     Ok(endpoint)
@@ -344,6 +371,8 @@ enum Peers {
 pub struct P2PNet {
     node: Node,
     peers: Peers,
+    data_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<iroh::endpoint::Connection>>>,
+    http_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<iroh::endpoint::Connection>>>,
 }
 
 impl P2PNet {
@@ -362,11 +391,23 @@ impl P2PNet {
         }
     }
 
+    // DATA_ALPN 수신 연결 대기 (SimServer/ArClient 서버 모드에서 사용)
+    pub async fn accept_data(&self) -> Option<Connection> {
+        self.data_rx.lock().await.recv().await.map(Connection)
+    }
+
+    // HTTP_ALPN 수신 연결 대기 (SimServer 서버 모드에서 사용)
+    pub async fn accept_http_conn(&self) -> Option<iroh::endpoint::Connection> {
+        self.http_rx.lock().await.recv().await
+    }
+
+    // 상대 NodeAddr로 QUIC 데이터 채널 연결 수립
     pub async fn connect_udp(&self, addr: NodeAddr) -> Result<Connection> {
         let conn = self.node.endpoint.connect(addr, DATA_ALPN).await?;
         Ok(Connection(conn))
     }
 
+    // 상대 HTTP/3 서버에 GET 요청, 응답 바디 바이트 반환
     pub async fn request_http(&self, addr: NodeAddr, path: &str) -> Result<Vec<u8>> {
         let conn = self.node.endpoint.connect(addr, HTTP_ALPN).await?;
         let h3_conn = h3_iroh::Connection::new(conn);
@@ -390,37 +431,69 @@ impl P2PNet {
     }
 }
 
+// HTTP/3 요청 1개를 처리하고 응답 (SimServer 서버 모드에서 사용)
+pub async fn serve_h3_response(conn: iroh::endpoint::Connection, body: Bytes) -> Result<()> {
+    let h3_conn = h3_iroh::Connection::new(conn);
+    let mut h3_server: h3::server::Connection<_, Bytes> =
+        h3::server::builder().build(h3_conn).await?;
+    if let Some(resolver) = h3_server.accept().await? {
+        let (_req, mut stream) = resolver.resolve_request().await?;
+        stream
+            .send_response(http::Response::builder().status(200).body(())?)
+            .await?;
+        stream.send_data(body).await?;
+        stream.finish().await?;
+    }
+    Ok(())
+}
+
 pub async fn join_p2p_net(form: JoinForm) -> Result<P2PNet> {
     let endpoint = create_endpoint().await?;
     endpoint.online().await;
 
     let keypair = derive_network_keypair(&form.net_id.0, &form.pw.0);
-    let coord_id = read_coordinator_id(&keypair).await;
+
+    let coord_id = if form.my_name == "A" {
+        println!("[join] name is A, forcing coordinator role");
+        None
+    } else {
+        read_coordinator_id(&keypair).await
+    };
+
+    let (data_tx, data_rx) = mpsc::channel(32);
+    let (http_tx, http_rx) = mpsc::channel(32);
 
     match coord_id {
         None => {
-            println!("[join] no coordinator found, becoming coordinator");
+            println!("[join] becoming coordinator");
             publish_coordinator_id(&keypair, endpoint.id()).await?;
 
             let my_info = PeerInfo {
                 addr: endpoint.addr(),
                 name: form.my_name,
-                is_server: form.is_server,
+                peer_type: form.peer_type,
             };
 
             let peers: PeerMap = Arc::new(Mutex::new(HashMap::new()));
-            // 코디네이터 자신을 목록에 한 번 삽입 (conn/last_seen = None)
+            // 코디네이터 자신을 목록에 한 번 삽입
             peers.lock().unwrap().insert(endpoint.id(), PeerSlot {
                 info: my_info,
                 conn: None,
                 last_seen: None,
             });
 
-            let accept_handle = tokio::spawn(coord_accept_loop(endpoint.clone(), peers.clone()));
+            let accept_handle = tokio::spawn(accept_loop(
+                endpoint.clone(), Some(peers.clone()), data_tx, http_tx,
+            ));
             tokio::spawn(heartbeat_checker(peers.clone()));
 
             let node = Node { endpoint, _accept_task: accept_handle };
-            Ok(P2PNet { node, peers: Peers::Coord(peers) })
+            Ok(P2PNet {
+                node,
+                peers: Peers::Coord(peers),
+                data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
+                http_rx: Arc::new(tokio::sync::Mutex::new(http_rx)),
+            })
         }
         Some(coord_id) => {
             println!("[join] coordinator found: {coord_id}");
@@ -430,7 +503,7 @@ pub async fn join_p2p_net(form: JoinForm) -> Result<P2PNet> {
             let my_info = PeerInfo {
                 addr: endpoint.addr(),
                 name: form.my_name,
-                is_server: form.is_server,
+                peer_type: form.peer_type,
             };
             send_to_coord(&conn, &ToCoord::Register(my_info)).await?;
 
@@ -438,8 +511,16 @@ pub async fn join_p2p_net(form: JoinForm) -> Result<P2PNet> {
             tokio::spawn(peer_recv_loop(conn.clone(), peers.clone()));
             tokio::spawn(peer_heartbeat_loop(conn));
 
-            let node = Node { endpoint, _accept_task: tokio::spawn(async {}) };
-            Ok(P2PNet { node, peers: Peers::Peer(peers) })
+            let accept_handle = tokio::spawn(accept_loop(
+                endpoint.clone(), None, data_tx, http_tx,
+            ));
+            let node = Node { endpoint, _accept_task: accept_handle };
+            Ok(P2PNet {
+                node,
+                peers: Peers::Peer(peers),
+                data_rx: Arc::new(tokio::sync::Mutex::new(data_rx)),
+                http_rx: Arc::new(tokio::sync::Mutex::new(http_rx)),
+            })
         }
     }
 }
