@@ -55,7 +55,7 @@ impl Connection {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum PeerType {
-    SimServer { http_port: u16, udp_port: u16 },
+    SimServer,
     MidServer,
     ArClient { udp_port: u16 },
 }
@@ -135,14 +135,14 @@ impl P2PNet {
         Ok(body)
     }
 
-    pub async fn notice_sim_online(&self, http_port: u16, udp_port: u16) -> Result<()> {
+    pub async fn notice_sim_online(&self) -> Result<()> {
         match &self.peers {
             Peers::Coord(map) => {
-                set_peer_type_and_broadcast(map, self.node.id(), PeerType::SimServer { http_port, udp_port }).await;
+                set_peer_type_and_broadcast(map, self.node.id(), PeerType::SimServer).await;
             }
             Peers::Peer(_) => {
                 if let Some(conn) = &self.coord_conn {
-                    send_to_coord(conn, &ToCoord::NoticeSimOnline { http_port, udp_port }).await?;
+                    send_to_coord(conn, &ToCoord::NoticeSimOnline).await?;
                 }
             }
         }
@@ -164,12 +164,17 @@ impl P2PNet {
     }
 }
 
-pub async fn serve_h3_response(conn: iroh::endpoint::Connection, body: Bytes) -> Result<()> {
+pub async fn serve_h3_response<F>(conn: iroh::endpoint::Connection, body_fn: F) -> Result<()>
+where
+    F: FnOnce(&str) -> Bytes,
+{
     let h3_conn = h3_iroh::Connection::new(conn);
     let mut h3_server: h3::server::Connection<_, Bytes> =
         h3::server::builder().build(h3_conn).await?;
     if let Some(resolver) = h3_server.accept().await? {
-        let (_req, mut stream) = resolver.resolve_request().await?;
+        let (req, mut stream) = resolver.resolve_request().await?;
+        let path = req.uri().path();
+        let body = body_fn(path);
         stream
             .send_response(http::Response::builder().status(200).body(())?)
             .await?;
@@ -269,7 +274,7 @@ const PKARR_RELAY: &str = "https://dns.iroh.link/pkarr";
 enum ToCoord {
     Register(PeerInfo),
     Heartbeat,
-    NoticeSimOnline { http_port: u16, udp_port: u16 },
+    NoticeSimOnline,
     NoticeSimOffline,
 }
 
@@ -441,8 +446,8 @@ async fn handle_coord_conn(conn: iroh::endpoint::Connection, peers: PeerMap) {
                     slot.last_seen = Some(Instant::now());
                 }
             }
-            ToCoord::NoticeSimOnline { http_port, udp_port } => {
-                set_peer_type_and_broadcast(&peers, peer_id, PeerType::SimServer { http_port, udp_port }).await;
+            ToCoord::NoticeSimOnline => {
+                set_peer_type_and_broadcast(&peers, peer_id, PeerType::SimServer).await;
             }
             ToCoord::NoticeSimOffline => {
                 set_peer_type_and_broadcast(&peers, peer_id, PeerType::MidServer).await;

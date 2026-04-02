@@ -1,6 +1,7 @@
 mod utils;
 mod net;
 mod sim;
+mod watchdog;
 
 
 const MAX_NAME_BYTES: usize = 64;
@@ -29,8 +30,8 @@ impl From<usize> for UIMenu {
 }
 
 use net::{NetSetting, NetThread};
-use utils::{TripleBuffer, TripleBufWriter, TripleBufReader, TripleBufSwapper};
-use sim::{UserIn, SimOut, SimThread};
+use utils::TripleBuffer;
+use sim::{UserIn, SimOut, SimThread, SimIoBuf};
 use UIMenu::*;
 
 fn main() {
@@ -60,16 +61,18 @@ fn main() {
         SimOut::default(),
         SimOut::default(),
     ]);
-    let mut userin_r = Some(userin_r);
-    let mut userin_swap = Some(userin_swap);
-    let mut simout_w = Some(simout_w);
-    let mut simout_swap = Some(simout_swap);
+
+    let mut sim_io = Some(SimIoBuf {
+        userin_r,
+        userin_swap,
+        simout_w,
+        simout_swap,
+    });
     
     // 서버 스레드 실행
     let net = NetThread::new(&net_setting, userin_w, simout_r);
 
-    // 시뮬레이션 매니저 스레드 실행
-    let sim_manager = SimThread::new();
+    let mut sim: Option<SimThread> = None;
 
     // 사용자 입력 루프
     loop {
@@ -77,41 +80,31 @@ fn main() {
         printsh!("> ");
         match input::<usize>().into() {
             StartSimulation => {
-                if is_sim_running(&net) {
+                if let Some(io) = sim_io.take() {
+                    setup_python();
+                    printsh!("시뮬레이션 데이터가 있는 폴더: ");
+                    let sim_folder = input::<std::path::PathBuf>();
+                    sim = Some(SimThread::new(sim_folder.clone(), io));
+                    if let Err(e) = net.notice_sim_online(sim_folder) {
+                        println!("시뮬레이션 온라인 알림 실패: {e}");
+                    }
+                } else {
                     println!("이미 시뮬레이션이 실행 중입니다.");
-                    continue;
-                }
-                setup_python();
-                printsh!("시뮬레이션 데이터가 있는 폴더: ");
-                let sim_folder = input::<std::path::PathBuf>();
-                sim_manager.start_simulation(
-                    sim_folder.clone(),
-                    userin_r.take().expect("이미 실행 중"),
-                    userin_swap.take().expect("이미 실행 중"),
-                    simout_w.take().expect("이미 실행 중"),
-                    simout_swap.take().expect("이미 실행 중"),
-                );
-                if let Err(e) = net.notice_sim_online(sim_folder) {
-                    println!("시뮬레이션 온라인 알림 실패: {e}");
                 }
             }
             StopSimulation => {
-                printsh!("시뮬레이션을 종료합니다.");
-                let (r, rs, w, ws) = sim_manager.stop_simulation();
-                userin_r = Some(r);
-                userin_swap = Some(rs);
-                simout_w = Some(w);
-                simout_swap = Some(ws);
-                if let Err(e) = net.notice_sim_offline() {
-                    println!("시뮬레이션 오프라인 알림 실패: {e}");
+                if let Some(s) = sim.take() {
+                    sim_io = Some(s.stop());
+                    if let Err(e) = net.notice_sim_offline() {
+                        println!("시뮬레이션 오프라인 알림 실패: {e}");
+                    }
                 }
             }
             EnterSimulation => {
                 printsh!("어떤 그룹원의 시뮬레이션에 참가하시겠습니까?: ");
                 let name = input::<String>();
-                if let Some((ip, http, udp)) = net.sim_info(&name) {
-                     // ip:port/ 로 접속.
-                    show_qr(format!("{ip}@{http}@{udp}/"));
+                if let Some(addr) = net.sim_info(&name) {
+                    show_qr(format!("{addr}"));
                 } else {
                     println!("그룹원이 존재하지 않거나 시뮬레이션이 실행 중이지 않습니다");
                     continue;
@@ -197,9 +190,6 @@ impl eframe::App for QrApp {
     }
 }
 
-fn is_sim_running(net: &NetThread) -> bool {
-    matches!(net.my_peer_type(), p2p_core::PeerType::SimServer { .. })
-}
 
 fn show_group_info(setting: &NetSetting, peers: &[p2p_core::PeerInfo]) {
     println!("그룹명: {}  사용자명: {}  비밀번호: {}", setting.net_id, setting.name, setting.password);
@@ -210,7 +200,7 @@ fn show_group_info(setting: &NetSetting, peers: &[p2p_core::PeerInfo]) {
 
     println!("=== 그룹원 목록 ({}) ===", group_peers.len());
     for p in group_peers {
-        let sim = if matches!(p.peer_type, p2p_core::PeerType::SimServer { .. }) { " [시뮬 실행중]" } else { "" };
+        let sim = if matches!(p.peer_type, p2p_core::PeerType::SimServer) { " [시뮬 실행중]" } else { "" };
         println!("  {}{}", p.name, sim);
     }
 

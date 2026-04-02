@@ -73,6 +73,14 @@ impl<T> TripleBufReader<T> {
     }
 }
 
+pub trait Clearable {
+    fn clear(&mut self);
+}
+
+impl<T> Clearable for Vec<T> {
+    fn clear(&mut self) { self.clear(); }
+}
+
 impl<T> TripleBufSwapper<T> {
     // write 슬롯을 fresh로 올리고, spare를 새 write 슬롯으로
     pub fn swap(&self) {
@@ -84,5 +92,11 @@ impl<T> TripleBufSwapper<T> {
             (spare_idx as u64) | ((write_idx as u64) << 2),
             Ordering::Release,
         );
+    }
+
+    pub fn swap_and_clear(&self) where T: Clearable {
+        self.swap();
+        let write_idx = (self.0.state.load(Ordering::Acquire) & 0b11) as usize;
+        unsafe { (*self.0.bufs.get())[write_idx].clear(); }
     }
 }

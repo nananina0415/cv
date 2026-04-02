@@ -46,15 +46,12 @@ impl NetThread {
                     let ar_clients = ar_clients.clone();
                     let userin_tx = userin_tx.clone();
                     tokio::spawn(async move {
-                        let id = conn.remote_id();
                         loop {
                             let Ok(data) = conn.recv().await else { break };
                             if let Ok(msg) = serde_json::from_slice(&data) {
                                 let _ = userin_tx.send(msg).await;
                             }
                         }
-                        ar_clients.lock().expect("ar_clients mutex poisoned")
-                            .retain(|c| c.remote_id() != id);
                     });
                 }
             });
@@ -74,7 +71,6 @@ impl NetThread {
         {
             let ar_clients = ar_clients.clone();
             rt.spawn(async move {
-                let mut tick = 0u32;
                 loop {
                     let data = serde_json::to_vec(simout_r.read()).expect("SimOut 직렬화 실패");
                     let clients = ar_clients.lock().expect("ar_clients mutex poisoned").clone();
@@ -84,8 +80,7 @@ impl NetThread {
                             dead.push(i);
                         }
                     }
-                    tick += 1;
-                    if tick % 60 == 0 && !dead.is_empty() {
+                    if !dead.is_empty() {
                         let mut clients = ar_clients.lock().expect("ar_clients mutex poisoned");
                         for i in dead.into_iter().rev() {
                             clients.remove(i);
@@ -110,10 +105,23 @@ impl NetThread {
             .clone()
     }
 
-    pub fn notice_sim_online(&self, http: u16, udp: u16) -> anyhow::Result<()> {
-        self.async_rt.block_on(self.net.notice_sim_online(http, udp))?;
+    pub fn notice_sim_online(&self, folder: std::path::PathBuf) -> anyhow::Result<()> {
+        let net = self.net.clone();
+        self.async_rt.spawn(async move {
+            loop {
+                let Some(conn) = net.accept_http_conn().await else { break };
+                let folder = folder.clone();
+                tokio::spawn(async move {
+                    let _ = p2p_core::serve_h3_response(conn, |path| {
+                        let file_path = folder.join(path.trim_start_matches('/'));
+                        std::fs::read(&file_path).unwrap_or_default().into()
+                    }).await;
+                });
+            }
+        });
+        self.async_rt.block_on(self.net.notice_sim_online())?;
         let mut t = self.my_peer_type.lock().expect("my_peer_type mutex poisoned");
-        *t = PeerType::SimServer { http_port: http, udp_port: udp };
+        *t = PeerType::SimServer;
         Ok(())
     }
 
@@ -124,11 +132,11 @@ impl NetThread {
         Ok(())
     }
 
-    pub fn sim_info(&self, name: &str) -> Option<(NodeAddr, u16, u16)> {
+    pub fn sim_info(&self, name: &str) -> Option<NodeAddr> {
         self.net.get_peers().into_iter()
             .find(|p| p.name == name)
             .and_then(|p| match p.peer_type {
-                PeerType::SimServer { http_port, udp_port } => Some((p.addr, http_port, udp_port)),
+                PeerType::SimServer => Some(p.addr),
                 _ => None,
             })
     }

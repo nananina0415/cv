@@ -52,9 +52,11 @@ async fn main() -> anyhow::Result<()> {
             while let Some(conn) = net_http.accept_http_conn().await {
                 let name = name_http.clone();
                 tokio::spawn(async move {
-                    let body = format!("hello http, here {name}");
-                    println!("[http] send: {body}");
-                    if let Err(e) = p2p_core::serve_h3_response(conn, bytes::Bytes::from(body)).await {
+                    if let Err(e) = p2p_core::serve_h3_response(conn, |_path| {
+                        let body = format!("hello http, here {name}");
+                        println!("[http] send: {body}");
+                        bytes::Bytes::from(body)
+                    }).await {
                         eprintln!("[server] http error: {e}");
                     }
                 });
@@ -69,9 +71,7 @@ async fn main() -> anyhow::Result<()> {
         println!("--- peers ({}) ---", peers.len());
         for p in &peers {
             let type_str = match &p.peer_type {
-                PeerType::SimServer { http_port, udp_port } => {
-                    format!("SimServer http={http_port} udp={udp_port}")
-                }
+                PeerType::SimServer => "SimServer".to_string(),
                 PeerType::MidServer => "MidServer".to_string(),
                 PeerType::ArClient { udp_port } => format!("ArClient udp={udp_port}"),
             };
@@ -85,13 +85,7 @@ fn prompt_peer_type() -> anyhow::Result<PeerType> {
     println!("Peer type: 1=SimServer  2=MidServer  3=ArClient");
     let choice = prompt("Choice: ")?;
     match choice.as_str() {
-        "1" => {
-            let http = prompt("HTTP port [55555]: ")?;
-            let udp = prompt("UDP port [44444]: ")?;
-            let http_port: u16 = if http.is_empty() { 55555 } else { http.parse()? };
-            let udp_port: u16 = if udp.is_empty() { 44444 } else { udp.parse()? };
-            Ok(PeerType::SimServer { http_port, udp_port })
-        }
+        "1" => Ok(PeerType::SimServer),
         "2" => Ok(PeerType::MidServer),
         "3" => {
             let udp_port: u16 = prompt("UDP port: ")?.parse()?;
