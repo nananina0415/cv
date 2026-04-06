@@ -29,8 +29,9 @@ impl From<usize> for UIMenu {
     }
 }
 
+use eframe::egui;
 use net::{NetSetting, NetThread};
-use utils::TripleBuffer;
+use utils::{TripleBuffer, input};
 use sim::{UserIn, SimOut, SimThread, SimIoBuf};
 use UIMenu::*;
 
@@ -83,11 +84,24 @@ fn main() {
                 if let Some(io) = sim_io.take() {
                     setup_python();
                     printsh!("시뮬레이션 데이터가 있는 폴더: ");
-                    let sim_folder = input::<std::path::PathBuf>();
-                    sim = Some(SimThread::new(sim_folder.clone(), io));
-                    if let Err(e) = net.notice_sim_online(sim_folder) {
-                        println!("시뮬레이션 온라인 알림 실패: {e}");
+                    let sim_folder = match std::path::absolute(input::<std::path::PathBuf>()) {
+                        Ok(p) => p,
+                        Err(e) => { println!("폴더 경로 오류: {e}"); continue; }
+                    };
+                    println!("시뮬레이션을 시작합니다. ({sim_folder.to_string_lossy()})");
+                    match SimThread::new(sim_folder.clone(), io) {
+                        Ok(s) => {
+                            sim = Some(s);
+                            if let Err(e) = net.notice_sim_online(sim_folder) {
+                                println!("시뮬레이션 온라인 알림 실패: {e}");
+                            }
+                        }
+                        Err((e, io)) => {
+                            println!("시뮬레이션 시작 실패: {e}");
+                            sim_io = Some(io);
+                        }
                     }
+                    println!("시뮬레이션이 시작되었습니다.");
                 } else {
                     println!("이미 시뮬레이션이 실행 중입니다.");
                 }
@@ -99,12 +113,14 @@ fn main() {
                         println!("시뮬레이션 오프라인 알림 실패: {e}");
                     }
                 }
+                println!("시뮬레이션이 종료되었습니다.");
             }
             EnterSimulation => {
+                show_group_info(&net_setting, &net.peer_list()); // 나중에 현재 시뮬 실행중인 사용자만 보일것.
                 printsh!("어떤 그룹원의 시뮬레이션에 참가하시겠습니까?: ");
                 let name = input::<String>();
                 if let Some(addr) = net.sim_info(&name) {
-                    show_qr(format!("{addr}"));
+                    show_qr(format!("{addr:?}"));
                 } else {
                     println!("그룹원이 존재하지 않거나 시뮬레이션이 실행 중이지 않습니다");
                     continue;
@@ -182,11 +198,9 @@ struct QrApp {
 }
 
 impl eframe::App for QrApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(&self.data);
-            ui.add(egui::Image::new(&self.texture));
-        });
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        ui.label(&self.data);
+        ui.add(egui::Image::new(&self.texture));
     }
 }
 
@@ -211,7 +225,10 @@ pub fn setup_python() {
     {
         let conda_prefix = std::env::var("CONDA_PREFIX")
             .expect("CONDA_PREFIX not set. Activate the cadverse environment first.");
-        unsafe { std::env::set_var("PYTHONHOME", conda_prefix) };
+        unsafe {
+            std::env::set_var("PYTHONHOME", &conda_prefix);
+            std::env::set_var("PYTHONPATH", format!("{}/Lib/site-packages", conda_prefix));
+        }
     }
 
     #[cfg(not(debug_assertions))]

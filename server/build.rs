@@ -23,10 +23,12 @@ fn main() {
 /// environment.yml 변경 시 cargo:rerun-if-changed에 의해 자동 재실행됨
 fn update_conda_env(env_yml: &Path) {
     println!("cargo:warning=Updating conda environment...");
-    let status = Command::new("conda")
-        .args(["env", "update", "--file", env_yml.to_str().unwrap(), "--prune", "--solver=libmamba"])
+    let conda = env::var("CONDA_PATH").unwrap_or_else(|_| "conda".to_string());
+    let env_path = env::var("CONDA_ENV_PATH").expect("CONDA_ENV_PATH not set in .cargo/config.toml");
+    let status = Command::new(&conda)
+        .args(["env", "update", "-p", &env_path, "--file", env_yml.to_str().unwrap(), "--prune", "--solver=libmamba"])
         .status()
-        .expect("conda not found");
+        .expect("conda not found. Set CONDA_PATH in .cargo/config.toml");
     assert!(status.success(), "conda env update failed");
 }
 
@@ -34,10 +36,15 @@ fn update_conda_env(env_yml: &Path) {
 fn pack_conda_env(bundle_out: &PathBuf) {
     println!("cargo:warning=Bundling Python environment with conda-pack...");
     std::fs::create_dir_all(bundle_out.parent().unwrap()).unwrap();
-    let status = Command::new("conda")
+    if bundle_out.exists() {
+        std::fs::remove_file(bundle_out).expect("python_env.tar.gz 삭제 실패");
+    }
+    let conda = env::var("CONDA_PATH").unwrap_or_else(|_| "conda".to_string());
+    let env_path = env::var("CONDA_ENV_PATH").expect("CONDA_ENV_PATH not set in .cargo/config.toml");
+    let status = Command::new(&conda)
         .args([
-            "run", "-n", "cadverse",
-            "conda-pack", "-n", "cadverse",
+            "run", "-p", &env_path,
+            "conda-pack", "-p", &env_path,
             "-o", bundle_out.to_str().unwrap(),
             "--ignore-missing-files",
         ])

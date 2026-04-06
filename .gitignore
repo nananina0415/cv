@@ -1,11 +1,13 @@
 # ── Rust ──────────────────────────────────────────────
 **/target/
+**/.cargo/config.toml
 
 # ── Python ────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+server/pychrono/build/*
 
 # ── conda-pack bundle ─────────────────────────────────
 python_env.tar.gz

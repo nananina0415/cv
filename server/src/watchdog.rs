@@ -21,7 +21,7 @@ impl<T: Send + 'static> Watchdog<T> {
         let data: Arc<Mutex<Option<T>>> = Arc::new(Mutex::new(None));
         let data_cb = data.clone();
         let folder_clone = folder.clone();
-        let mut debouncer = new_debouncer(Duration::from_millis(500), move |events| {
+        let mut debouncer = new_debouncer(Duration::from_millis(500), move |events: notify_debouncer_mini::DebounceEventResult| {
             if events.is_ok() {
                 on_change(folder_clone.clone(), &data_cb);
             }

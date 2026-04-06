@@ -43,7 +43,6 @@ impl NetThread {
                 loop {
                     let Some(conn) = net.accept_data().await else { break };
                     ar_clients.lock().expect("ar_clients mutex poisoned").push(conn.clone());
-                    let ar_clients = ar_clients.clone();
                     let userin_tx = userin_tx.clone();
                     tokio::spawn(async move {
                         loop {
