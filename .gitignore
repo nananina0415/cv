@@ -22,6 +22,10 @@ client/[Bb]uild/
 client/[Bb]uilds/
 client/[Uu]ser[Ss]ettings/
 client/.vs/
+client/.vscode/
 client/*.csproj
 client/*.sln
+client/*.slnx
+client/Assets/DefaultVolumeProfile.asset
+client/Assets/DefaultVolumeProfile.asset.meta
 client/**/*.meta linguist-generated=true
