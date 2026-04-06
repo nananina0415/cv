@@ -29,7 +29,6 @@ impl From<usize> for UIMenu {
     }
 }
 
-use eframe::egui;
 use net::{NetSetting, NetThread};
 use utils::{TripleBuffer, input};
 use sim::{UserIn, SimOut, SimThread, SimIoBuf};
@@ -88,7 +87,7 @@ fn main() {
                         Ok(p) => p,
                         Err(e) => { println!("폴더 경로 오류: {e}"); continue; }
                     };
-                    println!("시뮬레이션을 시작합니다. ({sim_folder.to_string_lossy()})");
+                    println!("시뮬레이션을 시작합니다. ({})", sim_folder.display());
                     match SimThread::new(sim_folder.clone(), io) {
                         Ok(s) => {
                             sim = Some(s);
@@ -112,6 +111,9 @@ fn main() {
                     if let Err(e) = net.notice_sim_offline() {
                         println!("시뮬레이션 오프라인 알림 실패: {e}");
                     }
+                }
+                else {
+                    println!("실행 중인 시뮬레이션이 없습니다.");
                 }
                 println!("시뮬레이션이 종료되었습니다.");
             }
@@ -155,53 +157,92 @@ fn main() {
 
 
 fn show_qr(data: String) {
-    std::thread::spawn(move || {
-        let code = qrcode::QrCode::with_error_correction_level(&data, qrcode::EcLevel::M).unwrap();
-        let modules: Vec<bool> = code.to_colors().iter()
-            .map(|c| *c == qrcode::Color::Dark)
-            .collect();
-        let size = (modules.len() as f64).sqrt() as usize;
-        let scale = 8usize;
-        let img_size = size * scale;
+    const QR_SIZE_CM: f32 = 5.0;
 
-        let mut pixels = vec![255u8; img_size * img_size * 4];
-        for y in 0..size {
-            for x in 0..size {
-                if modules[y * size + x] {
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            let i = ((y * scale + dy) * img_size + (x * scale + dx)) * 4;
-                            pixels[i] = 0; pixels[i+1] = 0; pixels[i+2] = 0;
+    #[cfg(target_os = "windows")]
+    fn get_system_dpi() -> f32 {
+        use std::ptr;
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetDC(hwnd: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+            fn GetDeviceCaps(hdc: *mut std::ffi::c_void, index: i32) -> i32;
+            fn ReleaseDC(hwnd: *mut std::ffi::c_void, hdc: *mut std::ffi::c_void) -> i32;
+        }
+        const LOGPIXELSX: i32 = 88;
+        unsafe {
+            let hdc = GetDC(ptr::null_mut());
+            if hdc.is_null() { return 96.0; }
+            let dpi = GetDeviceCaps(hdc, LOGPIXELSX) as f32;
+            ReleaseDC(ptr::null_mut(), hdc);
+            if dpi > 0.0 { dpi } else { 96.0 }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn get_system_dpi() -> f32 { 96.0 }
+
+    fn cm_to_pixels(cm: f32, dpi: f32) -> u32 {
+        let inches = cm / 2.54;
+        (inches * dpi) as u32
+    }
+
+    std::thread::spawn(move || {
+        let dpi = get_system_dpi();
+        let target_size_px = cm_to_pixels(QR_SIZE_CM, dpi);
+
+        let code = qrcode::QrCode::with_error_correction_level(data.as_bytes(), qrcode::EcLevel::M).unwrap();
+        let qr_modules = code.render::<char>()
+            .quiet_zone(false)
+            .module_dimensions(1, 1)
+            .build();
+
+        let qr_lines: Vec<&str> = qr_modules.lines().collect();
+        let qr_module_count = qr_lines.first().map(|l| l.chars().count()).unwrap_or(0);
+
+        let module_size = (target_size_px as f32 / qr_module_count as f32).ceil() as usize;
+        let module_size = module_size.max(1);
+
+        let qr_size = module_size * qr_module_count;
+        let margin = module_size * 2;
+        let window_size = qr_size + margin * 2;
+
+        let mut buffer: Vec<u32> = vec![0xFFFFFFFF; window_size * window_size];
+        for (y, line) in qr_lines.iter().enumerate() {
+            for (x, ch) in line.chars().enumerate() {
+                let color = if ch == '█' || ch == '#' { 0xFF000000u32 } else { 0xFFFFFFFFu32 };
+                for dy in 0..module_size {
+                    for dx in 0..module_size {
+                        let px = margin + x * module_size + dx;
+                        let py = margin + y * module_size + dy;
+                        if px < window_size && py < window_size {
+                            buffer[py * window_size + px] = color;
                         }
                     }
                 }
             }
         }
 
-        let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([img_size as f32 + 40.0, img_size as f32 + 60.0])
-                .with_resizable(false),
-            ..Default::default()
+        let title = format!("CADverse QR - {} ({:.1}cm)", data, QR_SIZE_CM);
+        let mut window = match minifb::Window::new(
+            &title,
+            window_size, window_size,
+            minifb::WindowOptions {
+                scale: minifb::Scale::X1,
+                scale_mode: minifb::ScaleMode::Center,
+                resize: false,
+                ..minifb::WindowOptions::default()
+            },
+        ) {
+            Ok(w) => w,
+            Err(e) => { eprintln!("QR 창 생성 실패: {e}"); return; }
         };
-        eframe::run_native("QR Code", options, Box::new(move |cc| {
-            let image = egui::ColorImage::from_rgba_unmultiplied([img_size, img_size], &pixels);
-            let texture = cc.egui_ctx.load_texture("qr", image, Default::default());
-            Ok(Box::new(QrApp { texture, data }))
-        })).unwrap();
+        window.set_target_fps(30);
+        while window.is_open() && !window.is_key_down(minifb::Key::Escape) {
+            window.update_with_buffer(&buffer, window_size, window_size).unwrap_or_else(|e| {
+                eprintln!("QR 버퍼 업데이트 오류: {e}");
+            });
+        }
     });
-}
-
-struct QrApp {
-    texture: egui::TextureHandle,
-    data: String,
-}
-
-impl eframe::App for QrApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        ui.label(&self.data);
-        ui.add(egui::Image::new(&self.texture));
-    }
 }
 
 
